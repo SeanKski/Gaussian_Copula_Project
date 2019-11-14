@@ -1,5 +1,6 @@
 import numpy as np
 from matplotlib import pyplot as plt
+from matplotlib import rc
 import torch
 from scipy import stats
 
@@ -44,7 +45,7 @@ class Gibbs:
 
         #######FOR TESTING
 #TODO: Delete this line:
-        data_true = data_true[:15,:]
+        # data_true = data_true[:15,:]
         ###################
 
         data_obs = np.full_like(data_true, np.nan)
@@ -82,6 +83,17 @@ class Gibbs:
                 corr[j, k] = stats.kendalltau(data_matrix[:, j], data_matrix[:, k], nan_policy='omit')[0]
         return corr
 
+    def calc_z_obs(self, data_obs, r):
+        # setting up the empirical cumulative distribution function
+        z_obs = np.full_like(data_obs, np.nan)
+        for j, (col, r_col) in enumerate(zip(data_obs.T, r.T)):
+            for i, data_ij in enumerate(col):
+                top = np.sum(r_col * (col < data_ij)) + 1  # top = sum(rdj * indicator(ydj < yij)) + 1
+                bot = np.sum(r_col) + 1  # sum(number of data in col_j) + 1
+                if r_col[i]:  # if observed
+                    z_obs[i,j] = stats.norm.ppf(top / bot)  # z_obs[ij] = NormalCDF_inv(top / bot)
+        return z_obs
+
     def gibbs_step_1(self, z_cal, z_corr):
         c = z_corr
         r = self.r
@@ -95,17 +107,16 @@ class Gibbs:
             sig_sqd = c[j, j] - np.matmul(v.T, c[np.ix_(nj, [j])])
 
             for i in range(len(r)):
-                if not r[i, j]:
-                    if np.any(np.isnan(z_calc)): # if there are nans then this is the first round of sampling
-                        # seeing if any other elements in row i are nan
-                        nans_in_row = np.where(np.isnan(z_cal[i]))[0]
-                        row_no_nan = np.delete(z_cal[i], nans_in_row)
-                        if len(nans_in_row) > 1:  # more than one nan in row
-                            v_no_corresponding_nan = np.delete(v.T, np.where(nans_in_row != j))  # take out locations \
-                            #  in v corresponding to nans in row i, OTHER THAN the nan in i,j (the nan we are imputing)
+                if not r[i, j]:  # if the element is unobserved
+                    if np.any(np.isnan(z_calc[i])):  # if there are nans then this is the first round of sampling
+                        z_row_nj = np.delete(z_cal[i], j)  # getting rid of j in this row
+                        nan_loc_row_nj = np.where(np.isnan(z_row_nj))  # seeing if there are any other nans in this row
+                        if len(nan_loc_row_nj):  # if 1,+, there are multiple nans, then other nans must be taken out
+                            z_row_nj = np.delete(z_row_nj, nan_loc_row_nj)  # taking other nans out
+                            v_row = np.delete(v, nan_loc_row_nj)  # taking the corresponding nan col in v_row
                         else:
-                            v_no_corresponding_nan = v
-                        mu = np.matmul(row_no_nan, v_no_corresponding_nan)
+                            v_row = v
+                        mu = np.matmul(z_row_nj, v_row)
 
                     else:  # this is not the first round of sampling, thus no nans
                         mu = np.matmul(z_calc[np.ix_([i], nj)], v)  # much easier eh?
@@ -114,25 +125,18 @@ class Gibbs:
 
         return z_cal
 
-    def gibbs_step_2(self, z_obs):
-        n = len(z_obs.T)
+    def gibbs_step_2(self, z_calc):
+        n = len(z_calc.T)
         scale_prior = np.identity(n)
-        DOF_priof = 1
-        wishart = stats.invwishart(DOF_priof+n, scale_prior + np.matmul(z_obs.T,z_obs))
-        corr = wishart.rvs(random_state=0)
+
+        DOF_prior = 1
+        a = DOF_prior+n
+        b = scale_prior + np.matmul(z_calc.T,z_calc)
+        inv_wishart = stats.invwishart(a, b)
+        corr = inv_wishart.rvs(random_state=0)
 
         return corr
 
-    def calc_z_obs(self, data_obs, r):
-        # setting up the empirical cumulative distribution function
-        z_obs = np.full_like(data_obs, np.nan)
-        for j, (col, r_col) in enumerate(zip(data_obs.T, r.T)):
-            for i, data_ij in enumerate(col):
-                top = np.sum(r_col * (col < data_ij)) + 1  # top = sum(rdj * indicator(ydj < yij)) + 1
-                bot = np.sum(r_col) + 1  # sum(number of data in col_j) + 1
-                if r_col[i]:  # if observed
-                    z_obs[i,j] = stats.norm.ppf(top / bot)  # z_obs[ij] = NormalCDF_inv(top / bot)
-        return z_obs
 
 
 
@@ -143,19 +147,48 @@ class Gibbs:
 
 if __name__ == '__main__':
     g = Gibbs('riboflavinV10.csv', beta=0.1)
+    gen_num = 9
+    # z_miss_loc = np.where(g.r == 0)
+    # missing_zs = g.z_obs[z_miss_loc]
+    jn1 = [j for j in g.z_obs.T]
+    z_obs_mean = np.nanmean(g.z_obs, axis=1, keepdims=True)
+    corr_norm_vect = []
+    z_gen_norm_vect = []
 
-    for gen in range(100):
+    for gen in range(gen_num):
         if gen == 0:
             #initilze priors
             corr_calc = np.identity(len(g.data_true.T))
             z_calc = g.z_obs
-
+        print(gen)
         z_calc = g.gibbs_step_1(z_calc, corr_calc)
         corr_calc = g.gibbs_step_2(z_calc)
 
+        #  performance measuring
+        corr_norm_vect.append(np.max(np.linalg.norm(g.corr_true - corr_calc, ord=1, axis=1)))
+
+        #  #finding the max L1 norm between imputed values of z_j and the mean of the respective feature
+        col_norm_max = []
+        for j, col in enumerate(z_calc.T):
+            temp = []
+            for i, val in enumerate(col):
+                if not g.r[i,j]:
+                    temp.append(np.linalg.norm(z_obs_mean[j] - val))
+            if len(temp):
+                col_norm_max.append(np.max(temp))
+        z_gen_norm_vect.append(np.max(col_norm_max))
 
     # calculating the L1 norms of the covariance and corr data
-    corr_l1_norm = np.linalg.norm(g.corr_true - g.corr_obs, ord=1, axis=1)
-    cov_l1_norm = np.linalg.norm(g.cov_true - g.corr_obs, ord=1, axis=1)
+    corr_l1_norm = np.linalg.norm(g.corr_true - corr_calc, ord=1, axis=1)
+    plt.plot(list(range(1, gen_num+1)), np.log(corr_norm_vect))
+    plt.title(r'Divergence of \hat C\ from Gibbs Sampler for Nonparanormal MCAR Data')
+    plt.xlabel('Generations')
+    plt.ylabel(r'$\log(\max(\parallel(\hat C\ - C)\parallel_1)$')
+    plt.show()
+    plt.plot(list(range(1,gen_num+1)), np.log(z_gen_norm_vect))
+    plt.title('Divergence of Imputed Values from Gibbs Sampler for Nonparanormal MCAR Data')
+    plt.xlabel('Generations')
+    plt.ylabel(r'$\log(\max(\parallel(\hat \mu_{Z_{miss}}\ - \mu_{Z_{miss}})\parallel_1)$')
+    plt.show()
 
     print('Done!')
